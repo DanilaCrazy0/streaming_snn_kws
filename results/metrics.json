@@ -1,0 +1,74 @@
+{
+  "dataset": "Google Speech Commands v0.02",
+  "num_classes": 35,
+  "n_recordings": 105829,
+  "n_speakers": 2618,
+  "splits": {"train": 84843, "val": 9981, "test": 11005},
+  "seed": 7,
+  "best_model": {
+    "family": "rnn",
+    "k": 2,
+    "recurrency": 3,
+    "hidden_size": 256,
+    "n_fft": 512,
+    "hop_length": 64,
+    "frame_shift_ms": 4,
+    "subband_preset": "p3_default",
+    "num_params": 1718051,
+    "best_epoch": 29,
+    "epochs": 30,
+    "run_id": "bonus_phase2_nfft512_hop64_k2_R3_H256",
+    "val": {
+      "final_accuracy": 0.9312,
+      "prefix_accuracy": 0.5721,
+      "stability_after_first_hit": 0.8739,
+      "time_to_correct_frames": 82.8,
+      "time_to_correct_ms": 331
+    },
+    "test": {
+      "final_accuracy": 0.9268,
+      "prefix_accuracy": 0.5668,
+      "stability_after_first_hit": 0.8701,
+      "time_to_correct_frames": 81.9,
+      "time_to_correct_ms": 327
+    },
+    "spike_rates": {
+      "fullband": 0.341,
+      "0_1_khz": 0.335,
+      "1_4_khz": 0.291,
+      "4_8_khz": 0.294,
+      "fusion": 0.384
+    }
+  },
+  "best_layered": {
+    "family": "layered",
+    "k": 2,
+    "branch_layers": 2,
+    "hidden_size": 256,
+    "n_fft": 256,
+    "hop_length": 64,
+    "subband_preset": "p7_full_0_2_2_5_5_8",
+    "epochs": 65,
+    "val_final_accuracy": 0.9347,
+    "test_final_accuracy": 0.9257
+  },
+  "memory_ablation_val_subset_256": {
+    "note": "Journal article numbers; not the diploma test set.",
+    "rnn_streaming_final": 0.922,
+    "rnn_reset_each_frame": 0.207,
+    "layered_streaming_final": 0.930,
+    "layered_reset_each_frame": 0.156,
+    "rnn_freeze_input": {"0.25": 0.195, "0.50": 0.641, "0.75": 0.883},
+    "rnn_prefix_corrupt_first_25pct": 0.809
+  },
+  "literature_kws": [
+    {"method": "BC-ResNet-8", "type": "ANN", "dataset": "GSC v2", "classes": 12, "accuracy": 0.987},
+    {"method": "MatchboxNet-3x2x64", "type": "ANN", "dataset": "GSC v2", "classes": 35, "accuracy": 0.972},
+    {"method": "SpikCommander", "type": "SNN", "dataset": "GSC v2", "classes": 35, "accuracy": 0.969},
+    {"method": "Pellegrini et al.", "type": "SNN", "dataset": "GSC v1", "classes": 12, "accuracy": 0.945},
+    {"method": "ED-sKWS", "type": "SNN", "dataset": "GSC v2", "classes": 35, "accuracy": 0.931},
+    {"method": "Yang et al.", "type": "SNN", "dataset": "GSC v2", "classes": 35, "accuracy": 0.929},
+    {"method": "SNN-KWS", "type": "SNN", "dataset": "GSC v2", "classes": 35, "accuracy": 0.929},
+    {"method": "this work", "type": "SNN", "dataset": "GSC v2", "classes": 35, "accuracy": 0.927}
+  ]
+}

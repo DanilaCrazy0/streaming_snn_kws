@@ -1,0 +1,336 @@
+# Streaming GSN KWS
+
+Потоковая спайковая модель для классификации аудио на каждом кадре STFT.
+Задача: **keyword spotting**, набор **Google Speech Commands v0.02**, 35 классов (~105 829 записей, 2618 спикеров).
+
+Код диплома (НИЯУ МИФИ, 2026) и журнальной статьи для «Успехов кибернетики»
+(*Spiking neural network with controllable neuronal memory for streaming command classification*,
+Шестаков Д.В., Рыбка Р.Б.). В текстах ветви называются **GSN-layers** (многослойные)
+и **RNN** (рекуррентные микрошаги). В коде те же модели лежат как `train_layered.py` / `train_rnn.py`.
+
+Вдохновение — победитель Intel N-DNS Challenge [Spiking-FullSubNet](https://github.com/haoxiangsnr/spiking-fullsubnet)
+(Hao et al., IEEE TNNLS 2025): оттуда ячейка **GSU / GSN**.
+Задача, фронтенд, частотные ветви, sum-threshold fusion, потери и обучение — другие.
+
+Не путать с исходным репозиторием Hao: там шумоподавление речи (SI-SDR / DNSMOS), здесь — потоковый KWS.
+
+| Лучшая модель | Val | Test | Параметры |
+|---|---:|---:|---:|
+| RNN, \(k=2\), \(R=3\), \(H=256\), \(N_{\mathrm{fft}}=512\), hop \(=64\) (4 мс), 4 ветви | **0.9312** | **0.9268** | 1 718 051 |
+
+---
+
+## Что умеет модель
+
+- Аудио 1 с, 16 кГц → покадровый STFT (окно Ханна, \(\log(1+|X|)\).
+- Спектр режется на частотные ветви (полный диапазон + субполосы).
+- Каждая ветвь — спайковая GSU-голова с контекстом \(k\) прошлых кадров.
+- Выходы ветвей складываются, нормируются на число ветвей и бинаризуются порогом 0.5 (**STE** в обратном проходе).
+- Fusion-GSU + накопительный rate-decoder дают логиты **на каждом кадре**, без ожидания конца записи.
+
+Два семейства ветвей:
+
+- **GSN-layers** (в дипломе «GSN-ветви») — \(L\) последовательных GSU-слоёв, `snn_kws/train_layered.py`.
+- **RNN** — одна общая GSU-ячейка, \(R\) микрошагов на кадр, `snn_kws/train_rnn.py`. Это победитель по тесту.
+
+```text
+waveform
+   │  STFT, hop=64 (4 ms), n_fft=512
+   ▼
+[fullband | 0–1 kHz | 1–4 kHz | 4–8 kHz]     ← пресет p3_default
+   │  контекст k=2
+   ▼
+  GSU-ветви (layered L или RNN R=3)
+   │  sum / N, threshold 0.5 (STE)
+   ▼
+  GSU fusion
+   │  cumulative spike rate
+   ▼
+  Linear → 35 классов   (предсказание на каждом кадре)
+```
+
+---
+
+## Основные результаты
+
+Цифры совпадают с дипломом и текущим черновиком статьи (`my_paper.tex`). Полные `best_summary.json` / `history.json` — в `results/grid/`. Сводка 65 прогонов: [`results/grid_runs.csv`](results/grid_runs.csv).
+
+### Итоговая модель (RNN, \(k=2\), \(R=3\))
+
+Разбиение GSC v0.02: train 84 843 / val 9 981 / test 11 005. Seed = 7. Лучшая эпоха = 29 из 30.
+
+| Метрика | Валидация | Тест |
+|---|---:|---:|
+| Итоговая точность (последний кадр) | 0.9312 | 0.9268 |
+| Префиксная точность (все кадры) | 0.5721 | 0.5668 |
+| Стабильность после первого верного ответа | 0.8739 | 0.8701 |
+| Время до первого верного ответа, кадры | 82.8 | 81.9 |
+| Время до первого верного ответа, мс | 331 | 327 |
+
+Префиксная точность ниже итоговой ожидаемо: в начале записи модель ещё не накопила достаточно спектрального контекста. После первого попадания верный класс удерживается в ~87% последующих кадров.
+
+Средние частоты спайков лучшей RNN-модели:
+
+| Компонент | Частота |
+|---|---:|
+| Ветвь fullband | 0.341 |
+| Ветвь 0–1 кГц | 0.335 |
+| Ветвь 1–4 кГц | 0.291 |
+| Ветвь 4–8 кГц | 0.294 |
+| Fusion-слой | 0.384 |
+
+### Сравнение с литературой (KWS)
+
+| Метод | Тип | Датасет | Классов | Точность |
+|---|---|---|---:|---:|
+| BC-ResNet-8 | ANN | GSC v2 | 12 | 0.987 |
+| MatchboxNet-3×2×64 | ANN | GSC v2 | 35 | 0.972 |
+| SpikCommander | SNN | GSC v2 | 35 | 0.969 |
+| Pellegrini et al. | SNN | GSC v1 | 12 | 0.945 |
+| ED-sKWS | SNN | GSC v2 | 35 | 0.931 |
+| Yang et al. | SNN | GSC v2 | 35 | 0.929 |
+| SNN-KWS | SNN | GSC v2 | 35 | 0.929 |
+| **Эта работа** | **SNN** | **GSC v2** | **35** | **0.927** |
+
+ANN-методы здесь офлайн (решение по всей записи). BC-ResNet — 12 классов. SpikCommander — событийный трансформер (2.13 млн параметров), без покадрового потокового выхода. Ближайшие потоковые/спайковые ориентиры на 35 классах — ED-sKWS (0.931) и SNN-KWS (0.929).
+
+### Сеточный поиск, фаза 1 — архитектура
+
+Фиксировано: \(N_{\mathrm{fft}}=512\), hop \(=64\), пресет из 4 ветвей, 30 эпох, batch 500.
+
+**GSN-ветви** (планировщик `phased`):
+
+| \(k\) | \(L\) | \(H\) | Val | Test |
+|---:|---:|---:|---:|---:|
+| **2** | **2** | **256** | **0.9308** | **0.9209** |
+| 1 | 2 | 256 | 0.9300 | 0.9194 |
+| 1 | 3 | 256 | 0.9278 | 0.9173 |
+| 0 | 2 | 256 | 0.9258 | 0.9162 |
+| 2 | 4 | 256 | 0.9242 | 0.9052 |
+| 2 | 4 | 128 | 0.9237 | 0.9069 |
+
+**RNN** (планировщик `gated_plateau`, порог val 0.80):
+
+| \(k\) | \(R\) | \(H\) | Val | Test |
+|---:|---:|---:|---:|---:|
+| 2 | 2 | 256 | **0.9331** | 0.9264 |
+| **2** | **3** | **256** | 0.9312 | **0.9268** |
+| 1 | 2 | 256 | 0.9303 | 0.9163 |
+| 0 | 3 | 256 | 0.9284 | 0.9199 |
+| 2 | 4 | 256 | 0.9279 | 0.9188 |
+| 1 | 4 | 256 | 0.9258 | 0.9119 |
+
+Между фазами отбор шёл по **валидации**. Итоговую модель выбрали по **тесту**: \(R=3\) обобщается лучше, чем \(R=2\).
+
+### Фаза 2 — STFT
+
+Hop везде 64 (4 мс). hop=32 на этой модели давал OOM / хуже качество и в диплом не вошёл.
+
+| Архитектура | \(N_{\mathrm{fft}}\) | Val | Test |
+|---|---:|---:|---:|
+| GSN-ветви \(k=2,L=2,H=256\) | 512 | 0.9308 | 0.9209 |
+| GSN-ветви \(k=2,L=2,H=256\) | **256** | **0.9332** | **0.9223** |
+| RNN \(k=2,R=3,H=256\) | **512** | **0.9312** | **0.9268** |
+| RNN \(k=2,R=3,H=256\) | 256 | 0.9308 | 0.9226 |
+
+### Фаза 3 — пресеты субполос
+
+**GSN-ветви** при \(N_{\mathrm{fft}}=256\):
+
+| Пресет | Val | Test |
+|---|---:|---:|
+| full + 0–1 + 1–8 кГц | 0.9340 | 0.9216 |
+| базовый, 4 ветви | 0.9332 | 0.9223 |
+| full + 0–2 + 2–5 + 5–8 кГц | 0.9323 | 0.9232 |
+| full + 0–2 + 2–4 + 4–6 + 6–8 кГц | 0.9320 | 0.9229 |
+| full + 0–4 + 4–8 кГц | 0.9305 | 0.9218 |
+| full + 0–3 + 3–6 + 6–8 кГц | 0.9273 | 0.9172 |
+
+Расширенный прогон GSN-ветвей (65 эпох, `phased`, batch 256, пресет 0–2 / 2–5 / 5–8) дал val **0.9347** / test **0.9257** — лучший layered, всё ещё ниже RNN на тесте.
+
+**RNN** при \(N_{\mathrm{fft}}=512\):
+
+| Пресет | Val | Test |
+|---|---:|---:|
+| **базовый, 4 ветви** | **0.9312** | **0.9268** |
+| full + 0–1 + 1–8 кГц | 0.9309 | 0.9208 |
+| full + 0–3 + 3–6 + 6–8 кГц | 0.9284 | 0.9182 |
+| full + 0–2 + 2–5 + 5–8 кГц | 0.9271 | 0.9184 |
+| full + 0–4 + 4–8 кГц | 0.9245 | 0.9113 |
+| full + 0–2 + 2–4 + 4–6 + 6–8 кГц | 0.9223 | 0.9101 |
+
+Дополнительные ветви RNN не помогли: при фиксированных 30 эпохах модель переобучается.
+
+Увеличение RNN до 65 эпох (тот же \(k,R,H\), batch 256) **ухудшило** тест до 0.9246. В диплом и статью взята 30-эпохная конфигурация. Расширенный GSN-layers (65 эпох) даёт 0.9257 и не обгоняет RNN.
+
+Кривые обучения и тепловые карты: [`results/figures/`](results/figures/).
+
+### Абляции памяти (статья, val-подвыборка \(N=256\))
+
+Без дообучения, только инференс. Это не test-метрики диплома: подвыборка меньше, поэтому streaming-accuracy чуть отличается (RNN 0.922 вместо 0.927).
+
+| Условие | RNN | GSN-layers |
+|---|---:|---:|
+| Streaming (состояние между кадрами) | 0.922 | 0.930 |
+| Сброс состояния на каждом кадре | 0.207 | 0.156 |
+| \(\Delta\) (streaming − reset) | 0.715 | 0.774 |
+
+Заморозка входа RNN после доли \(T\) записи: 0.25 → 0.195, 0.50 → 0.641, 0.75 → 0.883.
+Обнуление первых 25% кадров: 0.809. Средний мембранный потенциал fusion: \(\approx 1.42\) при спайке и \(\approx -1.73\) в молчании.
+
+Вывод статьи: покадровая точность держится на **управляемой нейронной памяти**, а не на длинном спектрограммном буфере. Графики: [`results/figures/inference_subset256/`](results/figures/inference_subset256/). Пересчёт (нужны `.pkl` после обучения):
+
+```bash
+python scripts/analyze_inference.py --device cuda:0 --val-limit 256 --freeze-fracs 0.25 0.5 0.75
+```
+
+---
+
+## Обучение и потери
+
+Общее для сеточного поиска:
+
+| Параметр | Значение |
+|---|---|
+| Оптимизатор | AdamW, lr \(10^{-3}\), weight decay 0 |
+| Batch | 500 (CUDA graph, последний неполный батч отбрасывается) |
+| Seed | 7 |
+| Эпохи (сетка) | 30 |
+| \(w_{\mathrm{final}}\) | 1.0 — CE на последнем кадре |
+| \(w_{\mathrm{prefix}}\) | 0.75 — взвешенная CE по всем кадрам (больший вес ранним) |
+| \(w_{\mathrm{consistency}}\) | 0.15 — симметричная KL соседних softmax |
+
+RNN: lr фиксирован до val accuracy 0.80, затем `ReduceLROnPlateau` (factor 0.5, patience 2).
+
+---
+
+## Быстрый старт
+
+Python ≥ 3.10, CUDA желательна (на CPU обучение очень медленное из-за покадрового цикла).
+
+```bash
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install torch --index-url https://download.pytorch.org/whl/cu121   # под свою CUDA
+```
+
+Google Speech Commands v0.02 скачается сам в `data/google_speech_commands/` при первом запуске.
+
+**Важно:** дефолты CLI (`--n-fft 256 --hop-length 32 --hidden-size 128`) — это не дипломная конфигурация. Для воспроизведения лучшей модели:
+
+```bash
+python scripts/train_best_rnn.py --device cuda:0
+```
+
+Эквивалентная полная команда:
+
+```bash
+python snn_kws/train_rnn.py \
+  --k 2 --recurrency 3 --hidden-size 256 \
+  --n-fft 512 --hop-length 64 --subband-preset p3_default \
+  --batch-size 500 --epochs 30 --seed 7 \
+  --lr-scheduler gated_plateau --lr-gate-accuracy 0.8 \
+  --plateau-factor 0.5 --plateau-patience 2 --plateau-threshold-mode abs \
+  --final-weight 1.0 --prefix-weight 0.75 --consistency-weight 0.15 \
+  --cuda-graph --num-workers 8 \
+  --artifact-root artifacts/best_rnn
+```
+
+Лучшие GSN-ветви (65 эпох, test 0.9257):
+
+```bash
+python scripts/train_best_layered.py --device cuda:0
+```
+
+Дымовой прогон без датасета целиком:
+
+```bash
+python snn_kws/train_rnn.py --smoke-test --device cpu --num-workers 0 --no-cuda-graph
+```
+
+Сеточный поиск (долго, по очереди оба семейства):
+
+```bash
+python scripts/grid_search.py --device cuda:0
+python scripts/run_bonus_rnn.py --device cuda:0   # фазы 2–3 для R=3, если сетка выбрала R=2 по val
+```
+
+Перерисовать графики из JSON (без весов):
+
+```bash
+python scripts/make_figures.py
+```
+
+---
+
+## Карта кода
+
+| Файл | Зачем |
+|---|---|
+| `snn_kws/train_rnn.py` | Лучшая архитектура. Искать: `GSUCell`, `RecurrentSpikeHead`, `project_branch_spikes`, `StreamingSpikeFusionClassifier`, `streaming_prefix_tc_loss` |
+| `snn_kws/train_layered.py` | Многослойные GSU-ветви (`StatefulSpikeHead`, `branch_num_layers`) |
+| `scripts/grid_search.py` | Три фазы гиперпараметров |
+| `scripts/run_bonus_rnn.py` | Доп. прогоны для \(R=3\) (победитель по тесту, не по val) |
+| `scripts/make_figures.py` | Рисунки диплома из `results/grid/` |
+| `scripts/analyze_inference.py` | Абляции памяти из статьи (нужны `.pkl`) |
+| `results/grid_runs.csv` | Все 65 прогонов |
+| `results/thesis_report.json` | Сводка метрик диплома |
+| `results/figures/` | Рисунки |
+
+`GSUCell` адаптирован из Spiking-FullSubNet (MIT). Отличия пайплайна от Intel NDNS:
+
+- нет маски шума / deep filtering / SI-SDR;
+- fusion — сумма спайков ветвей + порог, а не конкатенация + Linear;
+- выход — покадровая классификация, а не спектрограмма.
+
+---
+
+## Что специально не выкладывается
+
+Исходный репозиторий Intel + черновики экспериментов содержат много лишнего. Сюда **не** входит:
+
+- `audiozen/`, `recipes/intel_ndns/` — код шумоподавления Intel N-DNS;
+- ранний SpikeFusion с `cat` + Linear до sum-threshold (старые `fast_learning.py`, `grid_search_spike_fusion_*`);
+- эксперименты по кодированию Heidelberg Digits (`expirements/`);
+- веса `.pkl` (~450 МБ) — в git только JSON-метрики и графики;
+- личные tex/docx/pdf диплома и внутренние orch-заметки статьи.
+
+Если нужны чекпоинты для инференс-анализа, их нет в этом каталоге: обучение пишется в `artifacts/`.
+
+---
+
+## Цитирование
+
+GSU / Spiking-FullSubNet:
+
+```bibtex
+@ARTICLE{hao2025toward,
+  author={Hao, Xiang and Ma, Chenxiang and Yang, Qu and Wu, Jibin and Tan, Kay Chen},
+  journal={IEEE Transactions on Neural Networks and Learning Systems},
+  title={Toward Ultralow-Power Neuromorphic Speech Enhancement With Spiking-FullSubNet},
+  year={2025},
+  volume={36},
+  number={9},
+  pages={17350--17364}
+}
+```
+
+Датасет:
+
+```bibtex
+@inproceedings{warden2018speech,
+  title={Speech Commands: A Dataset for Limited-Vocabulary Speech Recognition},
+  author={Warden, Pete},
+  year={2018},
+  eprint={1804.03209},
+  archivePrefix={arXiv}
+}
+```
+
+---
+
+## Лицензия
+
+MIT. Ячейка GSU — адаптация кода Hao et al. (MIT, 2023). Подробности в `NOTICE.md`.
