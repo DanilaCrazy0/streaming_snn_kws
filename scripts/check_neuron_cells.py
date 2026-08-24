@@ -33,6 +33,71 @@ def _count_params(module: torch.nn.Module) -> int:
     return int(sum(p.numel() for p in module.parameters()))
 
 
+def check_lif_equations() -> None:
+    """Match sparch RLIF / RadLIF discrete updates on a 1-neuron cell."""
+    cell = LIFCell(1, 1, spike_threshold=1.0)
+    with torch.no_grad():
+        cell.weight_ih.fill_(1.0)
+        cell.weight_hh.zero_()
+        cell.bias_ih.zero_()
+        cell.alpha.fill_(0.9)
+    state = zeros_state(1, 1, torch.device("cpu"))
+    x = torch.tensor([[2.0]])
+    spikes, state = cell(x, state)
+    # u = 0.9*(0-0) + 0.1*2 = 0.2 < 1 → no spike
+    membrane = float(state.cx.detach())
+    assert abs(membrane - 0.2) < 1e-5, membrane
+    assert float(spikes.detach()) == 0.0
+    spikes, state = cell(x, state)
+    # u = 0.9*0.2 + 0.1*2 = 0.38
+    membrane = float(state.cx.detach())
+    assert abs(membrane - 0.38) < 1e-5, membrane
+    assert float(spikes.detach()) == 0.0
+
+    rest = LIFCell(4, 4, spike_threshold=1.0)
+    with torch.no_grad():
+        rest.weight_ih.zero_()
+        rest.weight_hh.zero_()
+        rest.bias_ih.zero_()
+    quiet, quiet_state = rest(torch.zeros(2, 4), zeros_state(2, 4, torch.device("cpu")))
+    assert float(quiet.detach().sum()) == 0.0
+    assert torch.isfinite(quiet_state.cx).all()
+
+    adlif = AdLIFCell(1, 1, spike_threshold=1.0)
+    with torch.no_grad():
+        adlif.weight_ih.fill_(1.0)
+        adlif.weight_hh.zero_()
+        adlif.bias_ih.zero_()
+        adlif.alpha.fill_(0.9)
+        adlif.beta.fill_(0.97)
+        adlif.a.zero_()
+        adlif.b.fill_(1.5)
+    state = zeros_state(1, 1, torch.device("cpu"))
+    driven = torch.tensor([[8.0]])
+    spiked = False
+    prev_adapt = 0.0
+    for _ in range(20):
+        spikes, state = adlif(driven, state)
+        assert torch.isfinite(state.cx).all() and torch.isfinite(state.ax).all()
+        if spiked:
+            # After a spike, w gets + b * s_prev (a=0), so adaptation must jump.
+            adapt = float(state.ax.detach())
+            assert adapt > prev_adapt + 0.5, (adapt, prev_adapt)
+            break
+        spiked = float(spikes.detach()) > 0.5
+        prev_adapt = float(state.ax.detach())
+    else:
+        raise AssertionError("AdLIF never spiked under a strong constant current")
+
+    noisy = LIFCell(16, 16, spike_threshold=1.0)
+    state = zeros_state(8, 16, torch.device("cpu"))
+    for _ in range(64):
+        spikes, state = noisy(torch.randn(8, 16) * 5.0, state)
+        assert torch.isfinite(spikes).all()
+        assert torch.isfinite(state.cx).all()
+    print("[eq]   LIF/AdLIF discrete updates match sparch; no NaN on long unroll", flush=True)
+
+
 def check_cells(device: torch.device) -> None:
     batch, hidden, input_size = 4, 32, 32
     x = torch.randn(batch, input_size, device=device)
@@ -157,6 +222,7 @@ def main() -> None:
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print({"device": str(device), "build_cell": build_cell.__name__}, flush=True)
+    check_lif_equations()
     check_cells(device)
     check_rnn_models(device)
     if not args.skip_cuda_graph:

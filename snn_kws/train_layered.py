@@ -41,6 +41,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 from snn_kws.neurons import (  # noqa: E402
+    DEFAULT_SPIKE_THRESHOLD,
     NEURON_TYPES,
     EfficientSpikingNeuron,
     MemoryState,
@@ -192,6 +193,7 @@ class SpikeFusionConfig:
     target_accuracy: float = 0.95
     subband_preset: str = DEFAULT_SUBBAND_PRESET
     neuron_type: str = "gsu"
+    spike_threshold: float = DEFAULT_SPIKE_THRESHOLD
 
     @property
     def target_len(self) -> int:
@@ -743,6 +745,7 @@ class StatefulSpikeHead(nn.Module):
         *,
         skip_in_proj: bool = False,
         neuron_type: str = "gsu",
+        spike_threshold: float = DEFAULT_SPIKE_THRESHOLD,
     ):
         super().__init__()
         self.input_size = input_size
@@ -750,6 +753,7 @@ class StatefulSpikeHead(nn.Module):
         self.num_layers = num_layers
         self.skip_in_proj = bool(skip_in_proj)
         self.neuron_type = normalize_neuron_type(neuron_type)
+        self.spike_threshold = float(spike_threshold)
         if self.skip_in_proj:
             if input_size != hidden_size:
                 raise ValueError(
@@ -765,6 +769,7 @@ class StatefulSpikeHead(nn.Module):
             shared_weights=False,
             bn=False,
             neuron_type=self.neuron_type,
+            spike_threshold=self.spike_threshold,
         )
 
     def init_state(self, batch_size: int, device: torch.device) -> list[MemoryState]:
@@ -828,6 +833,7 @@ class StreamingSpikeFusionClassifier(nn.Module):
         }
         self.branch_names = list(self.band_indices.keys())
         self.neuron_type = normalize_neuron_type(getattr(config, "neuron_type", "gsu"))
+        self.spike_threshold = float(getattr(config, "spike_threshold", DEFAULT_SPIKE_THRESHOLD))
         self.branch_heads = nn.ModuleDict()
         for name in self.branch_names:
             input_size = int(self.band_indices[name].numel()) * (self.k + 1)
@@ -836,6 +842,7 @@ class StreamingSpikeFusionClassifier(nn.Module):
                 hidden_size=config.hidden_size,
                 num_layers=config.branch_num_layers,
                 neuron_type=self.neuron_type,
+                spike_threshold=self.spike_threshold,
             )
         self.fusion_head = StatefulSpikeHead(
             input_size=config.fusion_hidden_size,
@@ -843,6 +850,7 @@ class StreamingSpikeFusionClassifier(nn.Module):
             num_layers=config.fusion_num_layers,
             skip_in_proj=True,
             neuron_type=self.neuron_type,
+            spike_threshold=self.spike_threshold,
         )
         self.rate_decoder = RateCodingDecoder(config.fusion_hidden_size, config.num_classes)
 
@@ -1254,6 +1262,7 @@ def load_streaming_spike_fusion_checkpoint(
         checkpoint = pickle.load(file_obj)
     config_dict = dict(checkpoint["config"])
     config_dict.setdefault("neuron_type", "gsu")
+    config_dict.setdefault("spike_threshold", DEFAULT_SPIKE_THRESHOLD)
     known = {field.name for field in SpikeFusionConfig.__dataclass_fields__.values()}
     config = SpikeFusionConfig(**{key: value for key, value in config_dict.items() if key in known})
     model = StreamingSpikeFusionClassifier(
@@ -1992,6 +2001,7 @@ def run_single_experiment(
         precompute_in_memory=True,
         subband_preset=str(args.subband_preset),
         neuron_type=normalize_neuron_type(args.neuron_type),
+        spike_threshold=float(args.spike_threshold),
     )
     set_seed(cfg.seed)
     device = resolve_device(args.device)
@@ -2122,6 +2132,7 @@ def run_single_experiment(
         "test_fraction": float(args.test_fraction),
         "num_classes": len(LABEL_NAMES),
         "neuron_type": normalize_neuron_type(args.neuron_type),
+        "spike_threshold": float(args.spike_threshold),
         "num_params": int(sum(p.numel() for p in model.parameters())),
     }
 
@@ -2163,6 +2174,12 @@ def parse_args() -> argparse.Namespace:
         choices=list(NEURON_TYPES),
         help="Spiking cell: gsu (published GSN), lif, or adlif. Same architecture "
         "and training recipe; only the membrane update changes.",
+    )
+    parser.add_argument(
+        "--spike-threshold",
+        type=float,
+        default=DEFAULT_SPIKE_THRESHOLD,
+        help="LIF/AdLIF membrane-potential threshold ϑ (fixed). Ignored for GSU.",
     )
     parser.add_argument("--fusion-hidden-size", type=int, default=128)
     parser.add_argument("--fusion-layers", type=int, default=1)
@@ -2337,6 +2354,7 @@ def run_training(args: argparse.Namespace) -> None:
             "k": int(args.k),
             "p": int(args.p),
             "neuron_type": str(args.neuron_type),
+            "spike_threshold": float(args.spike_threshold),
             "branch_layers": int(args.branch_layers),
             "hidden_size": int(args.hidden_size),
             "subband_preset": str(args.subband_preset),
@@ -2388,6 +2406,7 @@ def run_training(args: argparse.Namespace) -> None:
             "k": int(args.k),
             "p": int(args.p),
             "neuron_type": str(args.neuron_type),
+            "spike_threshold": float(args.spike_threshold),
             "branch_layers": int(args.branch_layers),
             "hidden_size": int(args.hidden_size),
             "subband_preset": str(args.subband_preset),

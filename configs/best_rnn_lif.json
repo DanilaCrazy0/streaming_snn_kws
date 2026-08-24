@@ -2,6 +2,7 @@
   "architecture": "rnn",
   "description": "Published RNN recipe with LIF cells instead of GSU. Isolates the GSN contribution.",
   "neuron_type": "lif",
+  "spike_threshold": 1.0,
   "k": 2,
   "recurrency": 3,
   "hidden_size": 256,

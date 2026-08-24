@@ -2,6 +2,7 @@
   "architecture": "rnn",
   "description": "Published RNN recipe with AdLIF cells instead of GSU (Bittar & Garner 2022).",
   "neuron_type": "adlif",
+  "spike_threshold": 1.0,
   "k": 2,
   "recurrency": 3,
   "hidden_size": 256,

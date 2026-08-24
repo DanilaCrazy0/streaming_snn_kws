@@ -256,6 +256,15 @@ python snn_kws/train_rnn.py --smoke-test --device cpu --num-workers 0 --no-cuda-
 `n_fft=512`, hop `64`, `p3_default`, 30 эпох, batch 500, CUDA graphs, seed 7)
 прогоняется с `--neuron-type lif`, затем `adlif`. Меняется только клетка мембраны.
 
+LIF/AdLIF — это не «GSU без гейта». Дискретная схема как в sparch (Bittar & Garner 2022):
+
+- **состояние:** мембранный потенциал `u` (`MemoryState.cx`); у AdLIF ещё ток адаптации `w`
+- **гиперпараметр порога:** `ϑ` (`--spike-threshold`, по умолчанию `1.0`); спайк если `u ≥ ϑ`
+- **LIF:** на нейрон учится leak `α = exp(−Δt/τ_u)` в диапазоне sparch `τ_u ∈ [5, 25] ms`
+- **AdLIF:** плюс медленный `w`: `w[t] = β w[t-1] + a u[t-1] + b s[t-1]`, затем
+  `u[t] = α (u[t-1] − s[t-1] ϑ) + (1−α) (I[t] − w[t])`. Это adaptation current, не moving threshold.
+- сброс берёт **предыдущий** спайк (как в sparch), диагональ `V` обнулена
+
 На арендованной RTX 4090:
 
 ```bash
