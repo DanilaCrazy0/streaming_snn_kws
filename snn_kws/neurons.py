@@ -32,6 +32,15 @@ ADLIF_BETA_RANGE = (0.96, 0.99)
 ADLIF_A_RANGE = (-1.0, 1.0)
 ADLIF_B_RANGE = (0.0, 2.0)
 SPIKE_THRESHOLD = 1.0
+# Hard bounds keep LIF/AdLIF from overflowing to inf/NaN under the same
+# AdamW + CUDA-graph recipe that GSU survives via its sigmoid forget gate.
+STATE_CLAMP = 20.0
+CURRENT_CLAMP = 50.0
+
+
+def _clamp(tensor: torch.Tensor, limit: float) -> torch.Tensor:
+    return tensor.clamp(-float(limit), float(limit))
+
 
 MemoryState = namedtuple("MemoryState", ["hx", "cx", "ax"])
 
@@ -201,11 +210,12 @@ class LIFCell(nn.Module):
     def forward(self, input: torch.Tensor, state: MemoryState):
         hx, cx = state.hx, state.cx
         current = F.linear(input, self.weight_ih, self.bias_ih) + F.linear(hx, self.weight_hh)
+        current = _clamp(current, CURRENT_CLAMP)
         alpha = self._alpha()
         u_pre = alpha * cx + (1.0 - alpha) * current
         # Threshold 0 matches GSU's triangle_spike(cy) so random init is not silent.
         hy = triangle_spike(u_pre)
-        cy = u_pre - hy * self.reset_strength
+        cy = _clamp(u_pre - hy * self.reset_strength, STATE_CLAMP)
         ax = state.ax if state.ax is not None else torch.zeros_like(cy)
         return hy, MemoryState(hy, cy, ax)
 
@@ -215,9 +225,9 @@ class AdLIFCell(nn.Module):
 
         I = W_ih x + W_hh h + b
         u_pre = α ⊙ u + (1-α) ⊙ I − w
-        z = H(u_pre − θ)
-        u = u_pre − z θ
-        w = β ⊙ w + a ⊙ u + b_adapt ⊙ z_prev
+        z = H(u_pre)
+        u = clip(u_pre − z)
+        w = clip(β ⊙ w + a ⊙ u + b_adapt ⊙ z_prev)
 
     ``α, β, a, b_adapt`` are per-neuron and mapped into the sparch ranges.
     Adaptation ``w`` lives in ``MemoryState.ax``.
@@ -272,11 +282,12 @@ class AdLIFCell(nn.Module):
         hx, cx = state.hx, state.cx
         wx = state.ax if state.ax is not None else torch.zeros_like(cx)
         current = F.linear(input, self.weight_ih, self.bias_ih) + F.linear(hx, self.weight_hh)
+        current = _clamp(current, CURRENT_CLAMP)
         alpha = self._alpha()
         u_pre = alpha * cx + (1.0 - alpha) * current - wx
         hy = triangle_spike(u_pre)
-        cy = u_pre - hy * self.reset_strength
-        wy = self._beta() * wx + self._a() * cx + self._b() * hx
+        cy = _clamp(u_pre - hy * self.reset_strength, STATE_CLAMP)
+        wy = _clamp(self._beta() * wx + self._a() * cy + self._b() * hx, STATE_CLAMP)
         return hy, MemoryState(hy, cy, wy)
 
 
