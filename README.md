@@ -250,6 +250,33 @@ python scripts/train_best_layered.py --device cuda:0
 python snn_kws/train_rnn.py --smoke-test --device cpu --num-workers 0 --no-cuda-graph
 ```
 
+### Сравнение нейронов (LIF / AdLIF vs GSN)
+
+Чтобы измерить вклад именно GSU, тот же опубликованный RNN-рецепт (`k=2, R=3, H=256`,
+`n_fft=512`, hop `64`, `p3_default`, 30 эпох, batch 500, CUDA graphs, seed 7)
+прогоняется с `--neuron-type lif`, затем `adlif`. Меняется только клетка мембраны.
+
+На арендованной RTX 4090:
+
+```bash
+python scripts/check_neuron_cells.py --device cuda:0          # ~30 с, без датасета
+python scripts/run_neuron_ablation.py --device cuda:0         # LIF, затем AdLIF
+```
+
+Ожидайте порядка 2×30–40 мин при batch 500. Если OOM — добавьте `-- --batch-size 400`.
+Пропуски уже готовых `best_summary.json` безопасны; `--force` переобучает.
+
+Отдельные прогоны:
+
+```bash
+python scripts/train_best_rnn_lif.py --device cuda:0
+python scripts/train_best_rnn_adlif.py --device cuda:0
+```
+
+Сводка: `artifacts/ablation_rnn_neurons/comparison.json`. Опубликованный GSU
+(val 0.9312 / test 0.9268) в таблицу подставляется из диплома, без переобучения.
+`--architecture layered` — тот же обмен клеток на лучшем GSN-layers конфиге (65 эпох).
+
 Сеточный поиск (долго, по очереди оба семейства):
 
 ```bash
@@ -269,8 +296,10 @@ python scripts/make_figures.py
 
 | Файл | Зачем |
 |---|---|
-| `snn_kws/train_rnn.py` | Лучшая архитектура. Искать: `GSUCell`, `RecurrentSpikeHead`, `project_branch_spikes`, `StreamingSpikeFusionClassifier`, `streaming_prefix_tc_loss` |
-| `snn_kws/train_layered.py` | Многослойные GSU-ветви (`StatefulSpikeHead`, `branch_num_layers`) |
+| `snn_kws/neurons.py` | Клетки GSU / LIF / AdLIF, triangle surrogate, CUDA-graph-safe state |
+| `snn_kws/train_rnn.py` | Лучшая архитектура. `--neuron-type {gsu,lif,adlif}`. Искать: `RecurrentSpikeHead`, `project_branch_spikes`, `StreamingSpikeFusionClassifier` |
+| `snn_kws/train_layered.py` | Многослойные ветви (`StatefulSpikeHead`, `branch_num_layers`), тот же `--neuron-type` |
+| `scripts/run_neuron_ablation.py` | Последовательный прогон LIF → AdLIF на опубликованном рецепте |
 | `scripts/grid_search.py` | Три фазы гиперпараметров |
 | `scripts/run_bonus_rnn.py` | Доп. прогоны для \(R=3\) (победитель по тесту, не по val) |
 | `scripts/make_figures.py` | Рисунки диплома из `results/grid/` |

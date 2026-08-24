@@ -21,10 +21,10 @@ import gc
 import math
 import pickle
 import random
+import sys
 import tarfile
 import time
 import urllib.request
-from collections import namedtuple
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -35,8 +35,19 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn import Parameter
 from torch.utils.data import DataLoader, Dataset
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from snn_kws.neurons import (  # noqa: E402
+    NEURON_TYPES,
+    EfficientSpikingNeuron,
+    MemoryState,
+    normalize_neuron_type,
+    set_compile_cells,
+    zeros_state,
+)
 
 
 SUBBAND_PRESETS: dict[str, tuple[tuple[str, float, float], ...]] = {
@@ -180,6 +191,7 @@ class SpikeFusionConfig:
     precompute_in_memory: bool = True
     target_accuracy: float = 0.95
     subband_preset: str = DEFAULT_SUBBAND_PRESET
+    neuron_type: str = "gsu"
 
     @property
     def target_len(self) -> int:
@@ -696,135 +708,6 @@ def make_gsc_dataloaders(
     return train_ds, val_ds, test_ds, train_loader, val_loader, test_loader
 
 
-class TriangleSurrogate(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, input, gamma=1.0):
-        out = input.ge(0.0).float()
-        # Store gamma as a plain Python float on ctx instead of a saved tensor.
-        # The previous version read it back via params[0].item() in backward,
-        # which forces a GPU->CPU sync. That sync breaks CUDA graph capture
-        # (and causes a torch.compile graph break). Math is unchanged.
-        ctx.save_for_backward(input)
-        ctx.gamma = float(gamma)
-        return out
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        (inp,) = ctx.saved_tensors
-        gamma = ctx.gamma
-        surrogate = (1.0 / (gamma * gamma)) * (gamma - inp.abs()).clamp(min=0)
-        return grad_output * surrogate, None
-
-
-triangle_spike = TriangleSurrogate.apply
-MemoryState = namedtuple("MemoryState", ["hx", "cx"])
-
-# Whether GSULayer should torch.compile its recurrent cell. Toggled by the
-# training entrypoint before the model is constructed. Compiling the cell fuses
-# the many tiny per-step kernels (matmuls, gate ops, surrogate spike) and cuts
-# kernel-launch overhead, which is the main reason the GPU sits at low
-# utilization in the original frame-by-frame loop.
-_COMPILE_CELLS = False
-
-
-def set_compile_cells(enabled: bool) -> None:
-    global _COMPILE_CELLS
-    _COMPILE_CELLS = bool(enabled)
-
-
-class GSUCell(nn.Module):
-    def __init__(self, input_size: int, hidden_size: int, shared_weights: bool = False, bn: bool = False):
-        super().__init__()
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.shared_weights = shared_weights
-        self.use_bn = bn
-        if shared_weights:
-            self.weight_ih = Parameter(torch.empty(hidden_size, input_size))
-            self.weight_hh = Parameter(torch.empty(hidden_size, hidden_size))
-        else:
-            self.weight_ih = Parameter(torch.empty(2 * hidden_size, input_size))
-            self.weight_hh = Parameter(torch.empty(2 * hidden_size, hidden_size))
-        self.bias_ih = Parameter(torch.zeros(2 * hidden_size))
-        self.reset_parameters()
-        if self.use_bn:
-            self.batchnorm = nn.BatchNorm1d(hidden_size)
-
-    def reset_parameters(self):
-        stdv = 1.0 / math.sqrt(self.hidden_size) if self.hidden_size > 0 else 0.0
-        for parameter in self.parameters():
-            nn.init.uniform_(parameter, -stdv, stdv)
-
-    def expanded_weights(self):
-        if self.shared_weights:
-            return self.weight_ih.repeat(2, 1), self.weight_hh.repeat(2, 1)
-        return self.weight_ih, self.weight_hh
-
-    def forward(self, input: torch.Tensor, state: MemoryState):
-        hx, cx = state
-        weight_ih, weight_hh = self.expanded_weights()
-        # Use F.linear instead of manual mm + bias so that autocast casts the
-        # bias consistently with the matmul inputs. The manual form lets
-        # torch.compile fuse mm + fp32-bias into a single addmm with mismatched
-        # dtypes under bf16 autocast, which raises a dtype error. Math is
-        # identical: F.linear(x, W, b) == x @ W.t() + b.
-        gates = F.linear(input, weight_ih, self.bias_ih) + F.linear(hx, weight_hh)
-        forget_gate, cell_gate = gates.chunk(2, dim=1)
-        lam = torch.sigmoid(forget_gate)
-        cy = lam * cx + (1.0 - lam) * cell_gate
-        if self.use_bn:
-            cy = self.batchnorm(cy)
-        hy = triangle_spike(cy)
-        return hy, MemoryState(hy, cy)
-
-
-class GSULayer(nn.Module):
-    def __init__(self, cell_cls, *cell_args):
-        super().__init__()
-        self.cell = cell_cls(*cell_args)
-        if _COMPILE_CELLS:
-            # Compile the bound forward method rather than wrapping the module,
-            # so the cell's parameters and state_dict keys stay unchanged and
-            # checkpoints remain compatible with a non-compiled reload.
-            self.cell.forward = torch.compile(self.cell.forward)
-
-    def forward(self, input_seq: torch.Tensor, state: MemoryState):
-        outputs = []
-        current_state = state
-        for time_idx in range(input_seq.size(0)):
-            out, current_state = self.cell(input_seq[time_idx], current_state)
-            outputs.append(out)
-        return torch.stack(outputs, dim=0), current_state
-
-
-class EfficientSpikingNeuron(nn.Module):
-    def __init__(
-        self,
-        input_size: int,
-        hidden_size: int,
-        num_layers: int,
-        shared_weights: bool = False,
-        bn: bool = False,
-    ):
-        super().__init__()
-        layers = [GSULayer(GSUCell, input_size, hidden_size, shared_weights, bn)]
-        for _ in range(num_layers - 1):
-            layers.append(GSULayer(GSUCell, hidden_size, hidden_size, shared_weights, bn))
-        self.layers = nn.ModuleList(layers)
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-
-    def forward(self, input_seq: torch.Tensor, states: list[MemoryState]):
-        output = input_seq
-        new_states = []
-        all_layer_outputs = [input_seq]
-        for layer, state in zip(self.layers, states):
-            output, new_state = layer(output, state)
-            new_states.append(new_state)
-            all_layer_outputs.append(output)
-        return output, new_states, all_layer_outputs
-
-
 def project_branch_spikes(
     branch_spikes: list[torch.Tensor],
     *,
@@ -859,12 +742,14 @@ class StatefulSpikeHead(nn.Module):
         num_layers: int,
         *,
         skip_in_proj: bool = False,
+        neuron_type: str = "gsu",
     ):
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.skip_in_proj = bool(skip_in_proj)
+        self.neuron_type = normalize_neuron_type(neuron_type)
         if self.skip_in_proj:
             if input_size != hidden_size:
                 raise ValueError(
@@ -879,16 +764,11 @@ class StatefulSpikeHead(nn.Module):
             num_layers=num_layers,
             shared_weights=False,
             bn=False,
+            neuron_type=self.neuron_type,
         )
 
     def init_state(self, batch_size: int, device: torch.device) -> list[MemoryState]:
-        return [
-            MemoryState(
-                torch.zeros(batch_size, self.hidden_size, device=device),
-                torch.zeros(batch_size, self.hidden_size, device=device),
-            )
-            for _ in range(self.num_layers)
-        ]
+        return [zeros_state(batch_size, self.hidden_size, device) for _ in range(self.num_layers)]
 
     def forward_step(
         self,
@@ -947,6 +827,7 @@ class StreamingSpikeFusionClassifier(nn.Module):
             ).items()
         }
         self.branch_names = list(self.band_indices.keys())
+        self.neuron_type = normalize_neuron_type(getattr(config, "neuron_type", "gsu"))
         self.branch_heads = nn.ModuleDict()
         for name in self.branch_names:
             input_size = int(self.band_indices[name].numel()) * (self.k + 1)
@@ -954,12 +835,14 @@ class StreamingSpikeFusionClassifier(nn.Module):
                 input_size=input_size,
                 hidden_size=config.hidden_size,
                 num_layers=config.branch_num_layers,
+                neuron_type=self.neuron_type,
             )
         self.fusion_head = StatefulSpikeHead(
             input_size=config.fusion_hidden_size,
             hidden_size=config.fusion_hidden_size,
             num_layers=config.fusion_num_layers,
             skip_in_proj=True,
+            neuron_type=self.neuron_type,
         )
         self.rate_decoder = RateCodingDecoder(config.fusion_hidden_size, config.num_classes)
 
@@ -1369,7 +1252,10 @@ def load_streaming_spike_fusion_checkpoint(
     checkpoint_path = Path(checkpoint_path)
     with checkpoint_path.open("rb") as file_obj:
         checkpoint = pickle.load(file_obj)
-    config = SpikeFusionConfig(**checkpoint["config"])
+    config_dict = dict(checkpoint["config"])
+    config_dict.setdefault("neuron_type", "gsu")
+    known = {field.name for field in SpikeFusionConfig.__dataclass_fields__.values()}
+    config = SpikeFusionConfig(**{key: value for key, value in config_dict.items() if key in known})
     model = StreamingSpikeFusionClassifier(
         config=config,
         k=int(checkpoint["k"]),
@@ -2059,10 +1945,13 @@ def make_checkpoint_path(
     branch_layers: int,
     hidden_size: int,
     subband_preset: str,
+    neuron_type: str = "gsu",
 ) -> Path:
+    neuron = normalize_neuron_type(neuron_type)
+    neuron_tag = "" if neuron == "gsu" else f"_{neuron}"
     return (
         artifact_root
-        / f"fast_k{k}_p{p}_L{branch_layers}_H{hidden_size}_{subband_preset}_nfft{n_fft}_hop{hop}_{slug}.pkl"
+        / f"fast_k{k}_p{p}_L{branch_layers}_H{hidden_size}_{subband_preset}_nfft{n_fft}_hop{hop}{neuron_tag}_{slug}.pkl"
     )
 
 
@@ -2102,6 +1991,7 @@ def run_single_experiment(
         seed=int(args.seed),
         precompute_in_memory=True,
         subband_preset=str(args.subband_preset),
+        neuron_type=normalize_neuron_type(args.neuron_type),
     )
     set_seed(cfg.seed)
     device = resolve_device(args.device)
@@ -2231,6 +2121,8 @@ def run_single_experiment(
         "val_fraction": float(args.val_fraction),
         "test_fraction": float(args.test_fraction),
         "num_classes": len(LABEL_NAMES),
+        "neuron_type": normalize_neuron_type(args.neuron_type),
+        "num_params": int(sum(p.numel() for p in model.parameters())),
     }
 
     del model, train_loader, val_loader, test_loader, train_ds, val_ds, test_ds
@@ -2265,6 +2157,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--hidden-size", type=int, default=128)
     parser.add_argument("--branch-layers", type=int, default=2)
+    parser.add_argument(
+        "--neuron-type",
+        default="gsu",
+        choices=list(NEURON_TYPES),
+        help="Spiking cell: gsu (published GSN), lif, or adlif. Same architecture "
+        "and training recipe; only the membrane update changes.",
+    )
     parser.add_argument("--fusion-hidden-size", type=int, default=128)
     parser.add_argument("--fusion-layers", type=int, default=1)
     parser.add_argument("--duration", type=float, default=DEFAULT_DURATION_SECONDS)
@@ -2419,6 +2318,7 @@ def run_training(args: argparse.Namespace) -> None:
         branch_layers=int(args.branch_layers),
         hidden_size=int(args.hidden_size),
         subband_preset=str(args.subband_preset),
+        neuron_type=str(args.neuron_type),
     )
     scaled_learning_rate = scale_learning_rate(
         float(args.learning_rate),
@@ -2436,6 +2336,7 @@ def run_training(args: argparse.Namespace) -> None:
             "model_variant": "sumfusion",
             "k": int(args.k),
             "p": int(args.p),
+            "neuron_type": str(args.neuron_type),
             "branch_layers": int(args.branch_layers),
             "hidden_size": int(args.hidden_size),
             "subband_preset": str(args.subband_preset),
@@ -2486,6 +2387,7 @@ def run_training(args: argparse.Namespace) -> None:
         "config": {
             "k": int(args.k),
             "p": int(args.p),
+            "neuron_type": str(args.neuron_type),
             "branch_layers": int(args.branch_layers),
             "hidden_size": int(args.hidden_size),
             "subband_preset": str(args.subband_preset),
