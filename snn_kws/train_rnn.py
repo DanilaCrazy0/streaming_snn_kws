@@ -638,6 +638,7 @@ def make_gsc_dataloaders(
     num_workers: int = 0,
     pin_memory: Optional[bool] = None,
     train_drop_last: bool = False,
+    eval_batch_size: Optional[int] = None,
 ) -> tuple[
     StreamingGSCDataset,
     StreamingGSCDataset,
@@ -662,6 +663,7 @@ def make_gsc_dataloaders(
     test_ds = StreamingGSCDataset(test_rows, config, precompute_in_memory=precompute_in_memory)
 
     batch_size = config.batch_size if batch_size is None else batch_size
+    eval_bs = int(batch_size if eval_batch_size is None else eval_batch_size)
     num_workers = int(num_workers)
     loader_kwargs = {
         "batch_size": batch_size,
@@ -677,7 +679,8 @@ def make_gsc_dataloaders(
         )
 
     # CUDA graphs require a fixed batch size, so the training loader can drop the
-    # last partial batch. Validation/test stay drop_last=False (run eager).
+    # last partial batch. Validation/test stay drop_last=False (run eager) and
+    # may use a smaller batch so they fit next to the graph's private pool.
     train_loader_kwargs = dict(loader_kwargs)
     train_loader_kwargs["drop_last"] = bool(train_drop_last)
     train_loader = DataLoader(
@@ -685,15 +688,17 @@ def make_gsc_dataloaders(
         shuffle=True,
         **train_loader_kwargs,
     )
+    eval_loader_kwargs = dict(loader_kwargs)
+    eval_loader_kwargs["batch_size"] = eval_bs
     val_loader = DataLoader(
         val_ds,
         shuffle=False,
-        **loader_kwargs,
+        **eval_loader_kwargs,
     )
     test_loader = DataLoader(
         test_ds,
         shuffle=False,
-        **loader_kwargs,
+        **eval_loader_kwargs,
     )
     return train_ds, val_ds, test_ds, train_loader, val_loader, test_loader
 
@@ -953,7 +958,6 @@ class StreamingSpikeFusionClassifier(nn.Module):
         fusion_spike_seq = []
         fusion_layer_spikes = []
         fusion_layer_potentials = []
-        fusion_inputs = []
 
         for time_idx in range(frames.shape[1]):
             current_branch_spikes = []
@@ -973,11 +977,11 @@ class StreamingSpikeFusionClassifier(nn.Module):
                         return_dynamics=False,
                     )
                 branch_states[name] = new_state
-                branch_spike_seq[name].append(branch_spikes)
+                if return_dynamics:
+                    branch_spike_seq[name].append(branch_spikes)
                 current_branch_spikes.append(branch_spikes)
 
             fusion_pre = project_branch_spikes(current_branch_spikes)
-            fusion_inputs.append(project_branch_spikes(current_branch_spikes, return_float=True))
             if return_dynamics:
                 fusion_spikes, fusion_state, fusion_dynamics = self.fusion_head.forward_step(
                     fusion_pre,
@@ -997,10 +1001,12 @@ class StreamingSpikeFusionClassifier(nn.Module):
             fusion_spike_seq.append(fusion_spikes)
 
         outputs = {
-            "branch_spike_seq": {name: torch.stack(values, dim=1) for name, values in branch_spike_seq.items()},
             "fusion_spike_seq": torch.stack(fusion_spike_seq, dim=1),
-            "fusion_inputs": torch.stack(fusion_inputs, dim=1),
         }
+        if return_dynamics:
+            outputs["branch_spike_seq"] = {
+                name: torch.stack(values, dim=1) for name, values in branch_spike_seq.items()
+            }
         decoder_logits, decoder_rates = self.rate_decoder(outputs["fusion_spike_seq"])
         outputs["decoder_logits"] = decoder_logits
         outputs["decoder_rates"] = decoder_rates
@@ -1052,10 +1058,8 @@ def _temporal_consistency_kl(decoder_logits: torch.Tensor) -> torch.Tensor:
 
 
 def _spike_rate_penalty(outputs: dict, target_rate: float) -> torch.Tensor:
-    penalties = []
-    fusion_rate = outputs["fusion_spike_seq"].float().mean()
-    penalties.append(torch.abs(fusion_rate - target_rate))
-    for spike_seq in outputs["branch_spike_seq"].values():
+    penalties = [torch.abs(outputs["fusion_spike_seq"].float().mean() - target_rate)]
+    for spike_seq in outputs.get("branch_spike_seq", {}).values():
         penalties.append(torch.abs(spike_seq.float().mean() - target_rate))
     return torch.stack(penalties).mean()
 
@@ -1724,6 +1728,10 @@ def fit_streaming_spike_fusion(
                 lightweight=True,
                 autocast_dtype=autocast_dtype,
             )
+        if graphed_forward is not None and device.type == "cuda":
+            # Graph private-pool memory stays reserved; this only returns
+            # leftover eager fragments so val/test can allocate beside it.
+            torch.cuda.empty_cache()
         with torch.inference_mode():
             val_metrics = run_streaming_epoch(
                 model=model,
@@ -1806,6 +1814,8 @@ def fit_streaming_spike_fusion(
     if history and not history[-1]["stop_reason"]:
         history[-1]["stop_reason"] = "max_epochs_reached" if not smoke_test else "smoke_test_complete"
     model.load_state_dict(best_state)
+    if graphed_forward is not None and device.type == "cuda":
+        torch.cuda.empty_cache()
     with torch.inference_mode():
         final_test_metrics = run_streaming_epoch(
             model=model,
@@ -1983,7 +1993,14 @@ def run_single_experiment(
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
         train_drop_last=cuda_graph,
+        eval_batch_size=min(int(cfg.batch_size), 128) if cuda_graph else None,
     )
+    if cuda_graph:
+        print(
+            f"[cuda-graph] val/test batch_size={val_loader.batch_size} "
+            f"(train batch_size={cfg.batch_size})",
+            flush=True,
+        )
 
     expected_workers = int(args.num_workers)
     if (
