@@ -285,9 +285,9 @@ def pick_best_configs(table2_aggregate: Path) -> dict[str, tuple[int, int]]:
 def build_specs(args: argparse.Namespace) -> list[RunSpec]:
     specs: list[RunSpec] = []
     if args.experiment == "table2":
-        for arch in ("ff", "rnn"):
-            for k in (0, 1, 2):
-                for depth in (2, 3, 4):
+        for arch in args.archs:
+            for k in args.ks:
+                for depth in args.depths:
                     for seed in args.seeds:
                         specs.append(
                             RunSpec(arch=arch, k=k, depth=depth, seed=int(seed))
@@ -335,6 +335,29 @@ def parse_args() -> argparse.Namespace:
         help="Override the experiment root (default: results/experiments/<experiment>).",
     )
     parser.add_argument("--seeds", type=int, nargs="+", default=list(DEFAULT_SEEDS))
+    parser.add_argument(
+        "--archs",
+        nargs="+",
+        choices=("ff", "rnn"),
+        default=["ff", "rnn"],
+        help="(table2) restrict architectures, e.g. --archs rnn.",
+    )
+    parser.add_argument(
+        "--ks",
+        type=int,
+        nargs="+",
+        choices=(0, 1, 2),
+        default=[0, 1, 2],
+        help="(table2) restrict k values, e.g. --ks 0.",
+    )
+    parser.add_argument(
+        "--depths",
+        type=int,
+        nargs="+",
+        choices=(2, 3, 4),
+        default=[2, 3, 4],
+        help="(table2) restrict depths (L/R), e.g. --depths 3 4.",
+    )
     parser.add_argument("--cache-dir", default="data/google_speech_commands")
     parser.add_argument("--device", default=None)
     parser.add_argument("--dry-run", action="store_true")
