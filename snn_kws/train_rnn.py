@@ -52,6 +52,7 @@ from snn_kws.neurons import (  # noqa: E402
     set_compile_cells,
     zeros_state,
 )
+from snn_kws.spike_counting import compute_spike_count_statistics  # noqa: E402
 
 
 SUBBAND_PRESETS: dict[str, tuple[tuple[str, float, float], ...]] = {
@@ -2052,6 +2053,29 @@ def run_single_experiment(
         else float("nan")
     )
     last_test_acc = test_acc_at_best
+
+    # Spike counting for the Table-2 "spikes" column: total spikes per example
+    # (all branch layers/micro-steps + fusion layers), mean/std over the
+    # validation set. ``fit_streaming_spike_fusion`` returns the model with the
+    # best-val weights already loaded.
+    spike_stats: Optional[dict] = None
+    if not smoke_test and not bool(args.skip_spike_count):
+        spike_stats = compute_spike_count_statistics(
+            model=model,
+            loader=val_loader,
+            device=device,
+            autocast_dtype=autocast_dtype,
+        )
+        print(
+            f"[spikes] val spikes/example: "
+            f"{spike_stats['spikes_per_example_mean']:.1f} +/- "
+            f"{spike_stats['spikes_per_example_std']:.1f} "
+            f"(branch={spike_stats['branch_spikes_per_example_mean']:.1f}, "
+            f"fusion={spike_stats['fusion_spikes_per_example_mean']:.1f}, "
+            f"n={spike_stats['num_examples']})",
+            flush=True,
+        )
+
     summary = {
         "k": k,
         "recurrency": int(args.recurrency),
@@ -2100,6 +2124,14 @@ def run_single_experiment(
         "neuron_type": normalize_neuron_type(args.neuron_type),
         "spike_threshold": float(args.spike_threshold),
         "num_params": int(sum(p.numel() for p in model.parameters())),
+        "seed": int(args.seed),
+        "val_spike_count": spike_stats,
+        "val_spikes_per_example_mean": (
+            spike_stats["spikes_per_example_mean"] if spike_stats is not None else float("nan")
+        ),
+        "val_spikes_per_example_std": (
+            spike_stats["spikes_per_example_std"] if spike_stats is not None else float("nan")
+        ),
     }
 
     del model, train_loader, val_loader, test_loader, train_ds, val_ds, test_ds
@@ -2147,6 +2179,12 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_SPIKE_THRESHOLD,
         help="LIF/AdLIF membrane-potential threshold ϑ (fixed). Ignored for GSU, "
         "which spikes at 0 on the gated membrane.",
+    )
+    parser.add_argument(
+        "--skip-spike-count",
+        action="store_true",
+        help="Skip the post-training spike-count pass over the validation set "
+        "(used for the Table-2 spikes column; costs roughly one extra val epoch).",
     )
     parser.add_argument("--fusion-hidden-size", type=int, default=128)
     parser.add_argument("--fusion-layers", type=int, default=1)
@@ -2358,6 +2396,7 @@ def run_training(args: argparse.Namespace) -> None:
         "config": {
             "k": int(args.k),
             "recurrency": int(args.recurrency),
+            "seed": int(args.seed),
             "neuron_type": str(args.neuron_type),
             "spike_threshold": float(args.spike_threshold),
             "hidden_size": int(args.hidden_size),

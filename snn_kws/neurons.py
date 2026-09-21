@@ -170,11 +170,6 @@ class GSUCell(nn.Module):
     def forward(self, input: torch.Tensor, state: MemoryState):
         hx, cx = state.hx, state.cx
         weight_ih, weight_hh = self.expanded_weights()
-        # Use F.linear instead of manual mm + bias so that autocast casts the
-        # bias consistently with the matmul inputs. The manual form lets
-        # torch.compile fuse mm + fp32-bias into a single addmm with mismatched
-        # dtypes under bf16 autocast, which raises a dtype error. Math is
-        # identical: F.linear(x, W, b) == x @ W.t() + b.
         gates = F.linear(input, weight_ih, self.bias_ih) + F.linear(hx, weight_hh)
         forget_gate, cell_gate = gates.chunk(2, dim=1)
         lam = torch.sigmoid(forget_gate)
@@ -320,7 +315,7 @@ class AdLIFCell(_RecurrentLIFMixin, nn.Module):
         adapt_prev = state.ax if state.ax is not None else torch.zeros_like(membrane_prev)
         current = self._input_current(input, spikes_prev)
         threshold = self.spike_threshold
-        # Adaptation from the previous step, then subtract it from this current.
+
         adapt = self._beta() * adapt_prev + self._a() * membrane_prev + self._b() * spikes_prev
         adapt = _clamp(adapt, STATE_CLAMP)
         alpha = self._alpha()
