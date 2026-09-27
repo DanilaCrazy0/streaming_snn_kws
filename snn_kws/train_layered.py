@@ -71,6 +71,28 @@ SUBBAND_PRESETS: dict[str, tuple[tuple[str, float, float], ...]] = {
         ("1_4_khz", 1000.0, 4000.0),
         ("4_8_khz", 4000.0, 8000.0),
     ),
+    # Branch ablation (п. II): p3_default minus one branch. Fusion threshold
+    # stays 0.5 -> with 3 branches mean>=0.5 is exactly "2 out of 3".
+    "p3_no_fullband": (
+        ("0_1_khz", 0.0, 1000.0),
+        ("1_4_khz", 1000.0, 4000.0),
+        ("4_8_khz", 4000.0, 8000.0),
+    ),
+    "p3_no_0_1": (
+        ("fullband", 0.0, 8000.0),
+        ("1_4_khz", 1000.0, 4000.0),
+        ("4_8_khz", 4000.0, 8000.0),
+    ),
+    "p3_no_1_4": (
+        ("fullband", 0.0, 8000.0),
+        ("0_1_khz", 0.0, 1000.0),
+        ("4_8_khz", 4000.0, 8000.0),
+    ),
+    "p3_no_4_8": (
+        ("fullband", 0.0, 8000.0),
+        ("0_1_khz", 0.0, 1000.0),
+        ("1_4_khz", 1000.0, 4000.0),
+    ),
     "p4_full_0_1_1_8": (
         ("fullband", 0.0, 8000.0),
         ("0_1_khz", 0.0, 1000.0),

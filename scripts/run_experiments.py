@@ -16,6 +16,12 @@ Plans
     Best configs are taken from the table2 aggregate (highest mean val
     accuracy across seeds) or overridden via ``--ff-best`` / ``--rnn-best``.
 
+``branch_ablation``
+    Branch ablation (п. II): p3_default minus one branch (4 presets), both
+    architectures on their best multiseed configs (ff k=2 L=2, rnn k=1 R=2;
+    overridable via ``--ff-best`` / ``--rnn-best``), retrained from scratch
+    with each seed. Fusion threshold stays 0.5 ("2 out of 3" with 3 branches).
+
 Storage layout
 --------------
     <exp_root>/runs/<run_id>/        history.json, best_summary.json, train.log, checkpoint
@@ -53,7 +59,13 @@ DEFAULT_SEEDS = (7, 10, 12, 80)
 DEFAULT_EXPERIMENT_ROOTS = {
     "table2": REPO_ROOT / "results" / "experiments" / "table2_multiseed",
     "hidden_search": REPO_ROOT / "results" / "experiments" / "hidden_search",
+    "branch_ablation": REPO_ROOT / "results" / "experiments" / "branch_ablation",
 }
+
+# Branch ablation (п. II): p3_default minus one branch, retrained from scratch
+# on the best multiseed configs. Fusion threshold stays 0.5 ("2 out of 3").
+BRANCH_ABLATION_PRESETS = ("p3_no_fullband", "p3_no_0_1", "p3_no_1_4", "p3_no_4_8")
+BRANCH_ABLATION_BEST = {"ff": (2, 2), "rnn": (1, 2)}  # arch -> (k, depth)
 
 # Published best configs (Table 2 of the manuscript); used as fallback for
 # hidden_search when no table2 aggregate is available yet.
@@ -321,6 +333,25 @@ def build_specs(args: argparse.Namespace) -> list[RunSpec]:
                             seed=int(seed),
                         )
                     )
+    elif args.experiment == "branch_ablation":
+        best = dict(BRANCH_ABLATION_BEST)
+        for arch, override in (("ff", args.ff_best), ("rnn", args.rnn_best)):
+            if override is not None:
+                k_str, d_str = override.split(",")
+                best[arch] = (int(k_str), int(d_str))
+        for arch in ("ff", "rnn"):
+            k, depth = best[arch]
+            for preset in BRANCH_ABLATION_PRESETS:
+                for seed in args.seeds:
+                    specs.append(
+                        RunSpec(
+                            arch=arch,
+                            k=k,
+                            depth=depth,
+                            subband_preset=preset,
+                            seed=int(seed),
+                        )
+                    )
     else:  # pragma: no cover - argparse enforces choices
         raise ValueError(args.experiment)
     return specs
@@ -384,13 +415,13 @@ def parse_args() -> argparse.Namespace:
         "--ff-best",
         default=None,
         metavar="K,L",
-        help="(hidden_search) override best ff config, e.g. '2,2'.",
+        help="(hidden_search/branch_ablation) override best ff config, e.g. '2,2'.",
     )
     parser.add_argument(
         "--rnn-best",
         default=None,
         metavar="K,R",
-        help="(hidden_search) override best rnn config, e.g. '2,3'.",
+        help="(hidden_search/branch_ablation) override best rnn config, e.g. '2,3'.",
     )
     return parser.parse_args()
 
